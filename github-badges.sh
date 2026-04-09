@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # ============================================================
 # github-badges.sh
-# Automates earning every earnable GitHub Achievement badge.
-# Usage: bash github-badges.sh [--coauthor "Name <email>"]
-# Requirements: gh CLI authenticated (gh auth login)
+# Run once to earn all earnable GitHub Achievement badges.
+# Creates a temp repo, triggers every badge, then deletes it.
+#
+# Usage:
+#   bash github-badges.sh
+#   bash github-badges.sh --coauthor "Name <ID+user@users.noreply.github.com>"
+#
+# Requirements: gh CLI installed and authenticated (gh auth login)
+# Get a co-author noreply email: gh api users/USERNAME --jq '"\(.id)+\(.login)@users.noreply.github.com"'
 # ============================================================
 
 set -euo pipefail
@@ -14,10 +20,8 @@ BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 log()    { echo -e "${BLUE}[*]${NC} $*"; }
 ok()     { echo -e "${GREEN}[+]${NC} $*"; }
 warn()   { echo -e "${YELLOW}[!]${NC} $*"; }
-fail()   { echo -e "${RED}[-]${NC} $*"; }
-header() { echo -e "\n${BOLD}${CYAN}==> $*${NC}"; }
+header() { echo -e "\n${BOLD}${CYAN}>>> $*${NC}"; }
 
-# ---- Parse args ----
 COAUTHOR=""
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -27,188 +31,171 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ---- Preflight ----
+BADGE_REPO=""
+
+# Cleanup on exit (always delete the temp repo)
+cleanup() {
+  if [[ -n "$BADGE_REPO" ]]; then
+    log "Cleaning up temp repo..."
+    gh api "repos/$USERNAME/$BADGE_REPO" --method DELETE 2>/dev/null && ok "Temp repo deleted." || true
+  fi
+}
+trap cleanup EXIT
+
+# ============================================================
+# PREFLIGHT
+# ============================================================
 header "Preflight"
 
 if ! command -v gh &>/dev/null; then
-  fail "gh CLI not found. Install from https://cli.github.com"; exit 1
+  echo -e "${RED}Error:${NC} gh CLI not found. Install from https://cli.github.com"; exit 1
 fi
-
 if ! gh auth status &>/dev/null; then
-  fail "Not authenticated. Run: gh auth login"; exit 1
+  echo -e "${RED}Error:${NC} Not authenticated. Run: gh auth login"; exit 1
 fi
 
 USERNAME=$(gh api user --jq '.login')
 ok "Authenticated as: ${BOLD}$USERNAME${NC}"
 
-# ---- Status check ----
-header "Current Badge Status"
-
-MERGED_PRS=$(gh api graphql -f query="{ user(login: \"$USERNAME\") { pullRequests(states: MERGED) { totalCount } } }" --jq '.data.user.pullRequests.totalCount' 2>/dev/null || echo 0)
-
-echo -e "  Merged PRs : ${BOLD}$MERGED_PRS${NC}"
-echo ""
-echo "  Will automate:"
-echo "    Quickdraw           open + close issue in <5 min"
-echo "    Pull Shark          2 PRs merged"
-echo "    YOLO                merge without review"
-if [[ -n "$COAUTHOR" ]]; then
-echo "    Pair Extraordinaire co-authored PR -> $COAUTHOR"
-else
-echo "    Pair Extraordinaire skipped (pass --coauthor to enable)"
-fi
-echo ""
-echo "  Manual only:"
-echo "    Galaxy Brain        answer 2 Discussions and get them accepted"
-echo "    Public Sponsor      sponsor any user for min \$1/month"
-echo "    Starstruck          get 16 stars on a personal repo"
-echo ""
-
-read -rp "$(echo -e "${YELLOW}Proceed?${NC} [y/N] ")" confirm
-[[ "${confirm,,}" == "y" ]] || { warn "Aborted."; exit 0; }
+MERGED_BEFORE=$(gh api graphql -f query="{ user(login: \"$USERNAME\") { pullRequests(states: MERGED) { totalCount } } }" --jq '.data.user.pullRequests.totalCount' 2>/dev/null || echo 0)
+log "Merged PRs before: $MERGED_BEFORE"
 
 # ============================================================
-# HELPER: create branch, push file, open PR, merge (no review)
+# CREATE TEMP REPO
 # ============================================================
+header "Creating temp repo"
+
+BADGE_REPO="gh-badges-$(date +%s)"
+FULL="$USERNAME/$BADGE_REPO"
+
+gh api user/repos \
+  --method POST \
+  -f name="$BADGE_REPO" \
+  -f description="Temp badge repo - deletes itself after running" \
+  -F private=false \
+  -F has_issues=true \
+  --jq '.full_name' | read -r _ || true
+
+log "Created: github.com/$FULL"
+sleep 3
+
+# Init README
+b64() { printf '%s' "$1" | base64 -w 0; }
+
+gh api "repos/$FULL/contents/README.md" \
+  --method PUT \
+  -f message="init: initial commit" \
+  -f content="$(b64 "# $BADGE_REPO")" >/dev/null
+
+ok "Repo initialized."
+
+# Helper: get default branch SHA
+get_sha() {
+  local branch
+  branch=$(gh api "repos/$FULL" --jq '.default_branch')
+  gh api "repos/$FULL/git/refs/heads/$branch" --jq '.object.sha'
+}
+
+# Helper: create branch -> push file -> open PR -> merge (no review = YOLO)
 merge_pr() {
-  local branch="$1" filename="$2" commit_msg="$3" pr_title="$4"
+  local branch="$1" filename="$2" title="$3" commit_msg="${4:-$3}"
 
+  local sha
+  sha=$(get_sha)
   local default_branch
-  default_branch=$(gh api "repos/$BADGE_FULL" --jq '.default_branch')
+  default_branch=$(gh api "repos/$FULL" --jq '.default_branch')
 
-  local head_sha
-  head_sha=$(gh api "repos/$BADGE_FULL/git/refs/heads/$default_branch" --jq '.object.sha')
+  gh api "repos/$FULL/git/refs" \
+    --method POST -f ref="refs/heads/$branch" -f sha="$sha" >/dev/null
 
-  # Create branch
-  gh api "repos/$BADGE_FULL/git/refs" \
-    --method POST \
-    -f ref="refs/heads/$branch" \
-    -f sha="$head_sha" >/dev/null
-
-  # Push file
-  local content
-  content=$(printf '%s' "$filename content" | base64 -w 0)
-  gh api "repos/$BADGE_FULL/contents/$filename" \
+  gh api "repos/$FULL/contents/$filename" \
     --method PUT \
     -f message="$commit_msg" \
-    -f content="$content" \
+    -f content="$(b64 "$filename")" \
     -f branch="$branch" >/dev/null
 
-  # Open PR
   local pr_num
-  pr_num=$(gh api "repos/$BADGE_FULL/pulls" \
+  pr_num=$(gh api "repos/$FULL/pulls" \
     --method POST \
-    -f title="$pr_title" \
+    -f title="$title" \
     -f head="$branch" \
     -f base="$default_branch" \
     --jq '.number')
 
-  # Merge without review
-  gh api "repos/$BADGE_FULL/pulls/$pr_num/merge" \
+  gh api "repos/$FULL/pulls/$pr_num/merge" \
     --method PUT \
     -f merge_method="squash" \
-    -f commit_title="$pr_title" >/dev/null
+    -f commit_title="$title" >/dev/null
 
-  log "PR #$pr_num merged ($branch)"
+  log "PR #$pr_num merged."
 }
 
 # ============================================================
-# 1. CREATE WORKING REPO
-# ============================================================
-header "Creating working repo"
-
-BADGE_REPO="badge-run-$(date +%s)"
-BADGE_FULL="$USERNAME/$BADGE_REPO"
-
-REPO_URL=$(gh api user/repos \
-  --method POST \
-  -f name="$BADGE_REPO" \
-  -f description="GitHub badge automation working repo - safe to delete after badges appear" \
-  -F private=false \
-  -F has_issues=true \
-  --jq '.html_url')
-
-log "Created: $REPO_URL"
-
-# Wait for GitHub to provision the repo
-sleep 3
-
-# Init with README
-README_B64=$(printf '# %s\n\nBadge automation working repo. Safe to delete after badges are awarded (24-48h).\n' "$BADGE_REPO" | base64 -w 0)
-gh api "repos/$BADGE_FULL/contents/README.md" \
-  --method PUT \
-  -f message="init: initial commit" \
-  -f content="$README_B64" >/dev/null
-
-ok "Repo ready."
-
-# ============================================================
-# 2. QUICKDRAW
+# QUICKDRAW - open + close issue < 5 min
 # ============================================================
 header "Quickdraw"
 
-ISSUE_NUM=$(gh api "repos/$BADGE_FULL/issues" \
+ISSUE=$(gh api "repos/$FULL/issues" \
   --method POST \
-  -f title="chore: initial setup tracking" \
-  -f body="Tracking setup. Closing as resolved." \
+  -f title="chore: initial setup" \
+  -f body="Resolving immediately." \
   --jq '.number')
 
-gh api "repos/$BADGE_FULL/issues/$ISSUE_NUM" \
+gh api "repos/$FULL/issues/$ISSUE" \
   --method PATCH -f state=closed >/dev/null
 
-ok "Quickdraw triggered. Issue #$ISSUE_NUM opened and closed."
+ok "Issue #$ISSUE opened and closed instantly."
 
 # ============================================================
-# 3. PULL SHARK + YOLO
+# PULL SHARK + YOLO - 2 merged PRs, no review
 # ============================================================
 header "Pull Shark + YOLO"
 
-log "Merging PR 1 of 2..."
-merge_pr "feat/setup-ci"   "ci.md"    "feat: add CI notes"    "feat: add CI configuration notes"
+log "Merging PR 1..."
+merge_pr "feat/ci" "ci.md" "feat: add CI notes"
 
-log "Merging PR 2 of 2..."
-merge_pr "feat/add-docs"   "NOTES.md" "docs: add project notes" "docs: add project notes"
+log "Merging PR 2..."
+merge_pr "feat/docs" "NOTES.md" "docs: add project notes"
 
-ok "Pull Shark + YOLO triggered. 2 PRs merged without review."
+ok "2 PRs merged without review."
 
 # ============================================================
-# 4. PAIR EXTRAORDINAIRE
+# PAIR EXTRAORDINAIRE - co-authored merged PR
 # ============================================================
 header "Pair Extraordinaire"
 
 if [[ -z "$COAUTHOR" ]]; then
-  warn "Skipped. To enable, rerun with:"
-  warn "  --coauthor \"Name <ID+username@users.noreply.github.com>\""
-  warn "  Get the ID from: gh api users/USERNAME --jq '.id'"
+  warn "Skipped - no co-author provided."
+  warn "Rerun with: --coauthor \"Name <ID+username@users.noreply.github.com>\""
+  warn "Get the value: gh api users/FRIEND_USERNAME --jq '\"\\(.id)+\\(.login)@users.noreply.github.com\"'"
 else
-  pair_default_branch=$(gh api "repos/$BADGE_FULL" --jq '.default_branch')
-  pair_head_sha=$(gh api "repos/$BADGE_FULL/git/refs/heads/$pair_default_branch" --jq '.object.sha')
+  local_sha=$(get_sha)
+  default_br=$(gh api "repos/$FULL" --jq '.default_branch')
 
-  gh api "repos/$BADGE_FULL/git/refs" \
+  gh api "repos/$FULL/git/refs" \
     --method POST \
-    -f ref="refs/heads/feat/pair-work" \
-    -f sha="$pair_head_sha" >/dev/null
+    -f ref="refs/heads/feat/collab" \
+    -f sha="$local_sha" >/dev/null
 
-  pair_content=$(printf 'Collaboration notes.' | base64 -w 0)
-  gh api "repos/$BADGE_FULL/contents/COLLAB.md" \
+  gh api "repos/$FULL/contents/COLLAB.md" \
     --method PUT \
-    -f "message=feat: add collaboration notes
+    -f "message=feat: collaboration notes
 
 Co-authored-by: $COAUTHOR" \
-    -f content="$pair_content" \
-    -f branch="feat/pair-work" >/dev/null
+    -f content="$(b64 'collaboration')" \
+    -f branch="feat/collab" >/dev/null
 
-  pair_pr_num=$(gh api "repos/$BADGE_FULL/pulls" \
+  pr_num=$(gh api "repos/$FULL/pulls" \
     --method POST \
-    -f title="feat: add collaboration notes" \
-    -f head="feat/pair-work" \
-    -f base="$pair_default_branch" \
+    -f title="feat: collaboration notes" \
+    -f head="feat/collab" \
+    -f base="$default_br" \
     --jq '.number')
 
-  gh api "repos/$BADGE_FULL/pulls/$pair_pr_num/merge" \
+  gh api "repos/$FULL/pulls/$pr_num/merge" \
     --method PUT \
     -f merge_method="squash" \
-    -f "commit_title=feat: add collaboration notes
+    -f "commit_title=feat: collaboration notes
 
 Co-authored-by: $COAUTHOR" >/dev/null
 
@@ -216,29 +203,26 @@ Co-authored-by: $COAUTHOR" >/dev/null
 fi
 
 # ============================================================
-# 5. SUMMARY
+# SUMMARY (cleanup runs automatically via trap)
 # ============================================================
-header "Done"
+header "Summary"
 
-NEW_MERGED=$(gh api graphql -f query="{ user(login: \"$USERNAME\") { pullRequests(states: MERGED) { totalCount } } }" --jq '.data.user.pullRequests.totalCount' 2>/dev/null || echo "?")
+MERGED_AFTER=$(gh api graphql -f query="{ user(login: \"$USERNAME\") { pullRequests(states: MERGED) { totalCount } } }" --jq '.data.user.pullRequests.totalCount' 2>/dev/null || echo "?")
 
 echo ""
 echo -e "  ${GREEN}Quickdraw${NC}            triggered"
-echo -e "  ${GREEN}Pull Shark${NC}           triggered  ($NEW_MERGED total merged PRs on account)"
+echo -e "  ${GREEN}Pull Shark${NC}           triggered   ($MERGED_BEFORE -> $MERGED_AFTER merged PRs)"
 echo -e "  ${GREEN}YOLO${NC}                 triggered"
 if [[ -n "$COAUTHOR" ]]; then
 echo -e "  ${GREEN}Pair Extraordinaire${NC}  triggered"
 else
-echo -e "  ${YELLOW}Pair Extraordinaire${NC}  skipped    (rerun with --coauthor)"
+echo -e "  ${YELLOW}Pair Extraordinaire${NC}  skipped     (pass --coauthor)"
 fi
-echo -e "  ${YELLOW}Galaxy Brain${NC}         manual     answer 2 Discussions, get them accepted"
-echo -e "  ${YELLOW}Public Sponsor${NC}       manual     sponsor any user for min \$1/month"
-echo -e "  ${YELLOW}Starstruck${NC}           manual     get 16 stars on a personal repo"
+echo -e "  ${YELLOW}Galaxy Brain${NC}         manual      get 2 Discussion answers accepted"
+echo -e "  ${YELLOW}Public Sponsor${NC}       manual      sponsor any dev for min \$1/month"
+echo -e "  ${YELLOW}Starstruck${NC}           manual      get 16 stars on a personal repo"
 echo ""
-echo -e "  Badges appear within ${BOLD}24-48h${NC} at:"
+echo -e "  Badges appear in ${BOLD}24-48h${NC} at:"
 echo -e "  ${CYAN}https://github.com/$USERNAME?tab=achievements${NC}"
 echo ""
-echo -e "  Working repo (delete after badges appear):"
-echo -e "  ${CYAN}$REPO_URL${NC}"
-echo ""
-ok "All done."
+ok "Done. Temp repo will be deleted now."
